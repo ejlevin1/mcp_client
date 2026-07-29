@@ -4,7 +4,8 @@ A Dart plugin for implementing [Model Context Protocol (MCP)](https://modelconte
 
 ## Features
 
-- **Multi-revision MCP support** with per-version capability negotiation — see _Protocol Versions_ below
+- **Multi-revision MCP support** with per-version capability negotiation — see _Protocol Versions_ below.
+  The revision is chosen per client (`McpClientConfig.protocolVersion`), not fixed at build time
 - **Unified transport configuration** — sealed `TransportConfig` for stdio / SSE / Streamable HTTP
 - **OAuth 2.1** — built-in authorization for secure HTTP transports
 - **Result-typed error handling** — `Result<Client, Error>` from `createAndConnect`, plus `McpError` for spec error codes
@@ -12,6 +13,7 @@ A Dart plugin for implementing [Model Context Protocol (MCP)](https://modelconte
   - **Resources** — server data, URI templates, subscriptions
   - **Tools** — server-side functions, progress tracking, structured output (2025-06-18+)
   - **Prompts** — reusable interaction templates with completion (2025-06-18+)
+  - **Completion** — `complete(ref, argument)` for `completion/complete` argument suggestions
   - **Roots** — filesystem boundary configuration; the server requests them via `roots/list`
   - **Sampling** — register a host LLM completion handler so the server can drive `sampling/createMessage`
   - **Elicitation** (2025-06-18) — register a user-input handler so the server can collect structured prompts
@@ -21,6 +23,7 @@ A Dart plugin for implementing [Model Context Protocol (MCP)](https://modelconte
   - **Cancellation** — `notifyCancelled(requestId, reason)` per spec notification
   - **Resource subscriptions** — `notifications/resources/updated`
   - **Session management** — automatic session validation and reconnection support
+  - **Ping** — `ping()` probes the peer, and an inbound `ping` is answered automatically
 - **Cross-platform**: Android, iOS, web, Linux, Windows, macOS (web supports SSE + Streamable HTTP; stdio is native-only)
 
 ## Protocol Versions
@@ -33,6 +36,11 @@ Implements the Model Context Protocol specification across **four** revisions, w
 | `2025-03-26` | Earlier 2025 revision; JSON-RPC batching available |
 | `2025-06-18` | Adds elicitation, structured tool output, resource links, OAuth Resource Server, MCP-Protocol-Version header. Removes JSON-RPC batching |
 | `2025-11-25` | Adds icons, sampling tool calling (`tools` / `toolChoice`), URL-mode elicitation, OIDC Discovery, Client ID Metadata Documents |
+
+`2026-07-28` is published and is the current specification revision. This build
+does not negotiate it — it is absent from `McpProtocol.supportedVersions`, so a
+peer is never offered it. The reference TypeScript SDK (1.30.0) does not
+implement it either. The versions in the table are what this build speaks.
 
 Runtime gates: `McpProtocol.supportsBatching(v)` / `supportsElicitation(v)` / `supportsStructuredToolOutput(v)` / `supportsIconsAndSamplingTools(v)` / `requiresProtocolHeader(v)`.
 

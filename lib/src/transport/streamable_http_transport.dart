@@ -58,6 +58,23 @@ class StreamableHttpTransportConfig {
 }
 
 /// Streamable HTTP client transport for MCP
+/// Operations whose target name is mirrored into `Mcp-Name` (2026-07-28).
+const Set<String> _methodsRequiringName = {
+  'tools/call',
+  'resources/read',
+  'prompts/get',
+};
+
+/// Encodes a header value using the spec's base64 sentinel when it cannot be
+/// carried as plain ASCII, or when it would otherwise be mistaken for one.
+String _encodeHeaderValue(String value) {
+  final needsEncoding = value.codeUnits.any((c) => c < 0x20 || c > 0x7e) ||
+      value.trim() != value ||
+      (value.startsWith('=?base64?') && value.endsWith('?='));
+  if (!needsEncoding) return value;
+  return '=?base64?${base64.encode(utf8.encode(value))}?=';
+}
+
 class StreamableHttpClientTransport implements ClientTransport {
   final StreamableHttpTransportConfig config;
   final http.Client _httpClient;
@@ -214,6 +231,27 @@ class StreamableHttpClientTransport implements ClientTransport {
           (McpProtocol.requiresProtocolHeader(_protocolVersion!) ||
               McpProtocol.isStateless(_protocolVersion!))) {
         headers['MCP-Protocol-Version'] = _protocolVersion!;
+      }
+
+      // 2026-07-28 mirrors the method — and, for the operations that name a
+      // target, that name — into headers so intermediaries can route without
+      // parsing the body. Values that cannot be carried as plain ASCII use the
+      // spec's base64 sentinel; a mirror that disagrees with the body is a
+      // rejectable mismatch, so it is derived from the body, never assumed.
+      if (_protocolVersion != null &&
+          McpProtocol.isStateless(_protocolVersion!) &&
+          message is Map) {
+        final method = message['method'];
+        if (method is String) {
+          headers['Mcp-Method'] = method;
+          if (_methodsRequiringName.contains(method)) {
+            final params = message['params'];
+            final target = params is Map ? (params['name'] ?? params['uri']) : null;
+            if (target != null) {
+              headers['Mcp-Name'] = _encodeHeaderValue('$target');
+            }
+          }
+        }
       }
 
       // Add OAuth token if available

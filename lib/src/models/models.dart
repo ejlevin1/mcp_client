@@ -330,12 +330,11 @@ class CallToolResult {
   final List<Content> content;
   final Map<String, dynamic>? structuredContent;
 
-  /// NON-STANDARD (makemind) legacy hint. Not part of the MCP `CallToolResult`
-  /// spec and honored nowhere. The standard pattern is: **enable** streaming
-  /// with a tool (`tools/call`) and **deliver** the stream via a reactive
-  /// resource (`subscriptions/listen` on 2026-07-28, `resources/subscribe` on
-  /// ≤2025-11-25). Retained + still serialized for backward compatibility;
-  /// slated for removal in the next major (3.0).
+  /// Non-standard streaming hint. Honored nowhere: enable streaming via a
+  /// tool and deliver the data through a reactive resource (`subscriptions/
+  /// listen` on 2026-07-28, `resources/subscribe` on ≤2025-11-25). Retained +
+  /// still serialized for backward compatibility; slated for removal in the
+  /// next major (3.0).
   @Deprecated(
       'Non-standard hint, honored nowhere. Enable streaming via a tool and '
       'deliver via a reactive resource (subscriptions/listen). Removed in 3.0.')

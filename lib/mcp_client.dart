@@ -4,9 +4,7 @@ import 'package:logging/logging.dart';
 import 'src/client/client.dart';
 import 'src/transport/transport.dart';
 import 'src/transport/streamable_http_transport.dart';
-import 'src/transport/sse_auth_transport.dart';
-import 'src/transport/sse_compressed_transport.dart';
-import 'src/transport/sse_heartbeat_transport.dart';
+import 'src/transport/legacy_sse.dart';
 import 'src/common/result.dart';
 import 'src/models/models.dart';
 import 'src/auth/oauth.dart';
@@ -16,9 +14,7 @@ export 'src/models/elicitation.dart';
 export 'src/client/client.dart';
 export 'src/transport/transport.dart';
 export 'src/transport/streamable_http_transport.dart';
-export 'src/transport/sse_auth_transport.dart';
-export 'src/transport/sse_compressed_transport.dart';
-export 'src/transport/sse_heartbeat_transport.dart';
+export 'src/transport/legacy_sse.dart';
 export 'src/protocol/protocol.dart';
 export 'src/protocol/request_meta.dart';
 export 'src/protocol/multi_round_trip.dart';
@@ -46,6 +42,9 @@ class McpClientConfig {
   /// The capabilities supported by the client
   final ClientCapabilities capabilities;
 
+  /// Protocol revision to speak. Defaults to this build's default version.
+  final String? protocolVersion;
+
   /// Maximum number of connection retry attempts
   final int maxRetries;
 
@@ -63,6 +62,7 @@ class McpClientConfig {
     required this.version,
     this.description,
     this.capabilities = const ClientCapabilities(),
+    this.protocolVersion,
     this.maxRetries = 3,
     this.retryDelay = const Duration(seconds: 2),
     this.requestTimeout = const Duration(seconds: 30),
@@ -75,6 +75,7 @@ class McpClientConfig {
     String? version,
     String? description,
     ClientCapabilities? capabilities,
+    String? protocolVersion,
     int? maxRetries,
     Duration? retryDelay,
     Duration? requestTimeout,
@@ -85,6 +86,7 @@ class McpClientConfig {
       version: version ?? this.version,
       description: description ?? this.description,
       capabilities: capabilities ?? this.capabilities,
+      protocolVersion: protocolVersion ?? this.protocolVersion,
       maxRetries: maxRetries ?? this.maxRetries,
       retryDelay: retryDelay ?? this.retryDelay,
       requestTimeout: requestTimeout ?? this.requestTimeout,
@@ -265,6 +267,7 @@ class McpClient {
       version: config.version,
       description: config.description,
       capabilities: config.capabilities,
+      protocolVersion: config.protocolVersion,
     );
   }
 

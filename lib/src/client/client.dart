@@ -29,8 +29,12 @@ class Client {
   /// Client capabilities configuration
   final ClientCapabilities capabilities;
 
-  /// Protocol version this client implements
-  final String protocolVersion = McpProtocol.defaultVersion;
+  /// Protocol version this client speaks on this connection.
+  ///
+  /// Settable per client because the peer decides what it supports: a build
+  /// pinned to one revision cannot fall back to a version a server offers, and
+  /// cannot be exercised against more than one revision.
+  final String protocolVersion;
 
   /// Transport connection
   ClientTransport? _transport;
@@ -121,12 +125,17 @@ class Client {
     required this.version,
     this.description,
     this.capabilities = const ClientCapabilities(),
-  }) {
+    String? protocolVersion,
+  }) : protocolVersion = protocolVersion ?? McpProtocol.defaultVersion {
     // Default `roots/list` handler returns the locally registered roots.
     // Hosts may override with [onListRoots] for dynamic roots.
     _requestHandlers['roots/list'] = (_) async => {
           'roots': _roots.map((r) => r.toJson()).toList(),
         };
+
+    // `ping` is answered by whichever side receives it, with an empty result.
+    // Without this a server keepalive gets `Method not found` back.
+    _requestHandlers['ping'] = (_) async => const {};
   }
 
   /// Connect the client to a transport.
@@ -883,6 +892,41 @@ class Client {
 
     // Spec method name is camelCase: `logging/setLevel`.
     await _sendRequest('logging/setLevel', {'level': level.name});
+  }
+
+  /// Sends `ping` and completes when the peer answers.
+  ///
+  /// The result is empty by definition; this is a liveness probe, so the value
+  /// is that it returned at all.
+  Future<void> ping() async {
+    if (!_initialized) {
+      throw McpError('Client is not initialized');
+    }
+    await _sendRequest('ping', const {});
+  }
+
+  /// Requests completion candidates for one argument of a prompt or resource
+  /// reference (`completion/complete`).
+  ///
+  /// [ref] is the reference being completed, e.g.
+  /// `{'type': 'ref/prompt', 'name': 'greet'}` or
+  /// `{'type': 'ref/resource', 'uri': 'test://item/{id}'}`.
+  /// [argument] is `{'name': ..., 'value': ...}` — the partial value typed so
+  /// far. [context] optionally carries already-resolved arguments.
+  Future<CompletionResult> complete(
+    Map<String, dynamic> ref,
+    Map<String, dynamic> argument, {
+    Map<String, dynamic>? context,
+  }) async {
+    if (!_initialized) {
+      throw McpError('Client is not initialized');
+    }
+    final result = await _sendRequest('completion/complete', {
+      'ref': ref,
+      'argument': argument,
+      if (context != null) 'context': context,
+    });
+    return CompletionResult.fromJson(result);
   }
 
   /// Register a notification handler

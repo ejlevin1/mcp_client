@@ -158,7 +158,7 @@ void main() async {
 
           if (readResult.isError == true) {
             logToConsoleAndFile(
-              '오류: ${(readResult.content.first as TextContent).text}',
+              'Error: ${(readResult.content.first as TextContent).text}',
               logger,
               logSink,
             );
@@ -224,7 +224,7 @@ void main() async {
               // Display only partial content if too long
               if (content.length > 500) {
                 logToConsoleAndFile(
-                  '${content.substring(0, 500)}...\n(내용이 너무 길어 일부만 표시)',
+                  '${content.substring(0, 500)}...\n(truncated: showing the first 500 characters)',
                   logger,
                   logSink,
                 );
@@ -257,7 +257,7 @@ void main() async {
     client.disconnect();
     logToConsoleAndFile('Client connection closed.', logger, logSink);
   } catch (e, stackTrace) {
-    logToConsoleAndFile('오류: $e', logger, logSink);
+    logToConsoleAndFile('Error: $e', logger, logSink);
     logToConsoleAndFile('Stack trace: $stackTrace', logger, logSink);
   } finally {
     // Close log file

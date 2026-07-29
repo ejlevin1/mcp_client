@@ -1,3 +1,55 @@
+## [2.1.1] - 2026-07-29 - Platform-conditional transports + specification conformance
+
+Two cuts. The transport split changes behavior only on platforms without
+`dart:io` — the STDIO and legacy SSE implementations are the same code, moved to
+the native branch of a conditional export. The conformance work adds methods and
+makes the protocol revision selectable; it removes nothing.
+
+### Added — methods the protocol defines that this client could not send
+
+Found by running this client against the official reference server: the calls
+simply did not exist on `Client`.
+
+- `ping()` — and an inbound `ping` is now answered with an empty result. The
+  server side already handled `ping`; the client neither sent nor answered one,
+  so a server keepalive got `Method not found` back.
+- `complete(ref, argument, {context})` for `completion/complete`.
+
+### Changed — the protocol revision is chosen per client
+
+`Client.protocolVersion` was `final`, fixed at build time. A client could not
+speak a revision a peer offered, and could not be exercised against more than
+one. It is now a constructor parameter, carried through `McpClientConfig`,
+`McpClient.createClient` and `copyWith`, defaulting to this build's default
+version.
+
+### Added — required request headers on revision `2026-07-28`
+
+The Streamable HTTP transport mirrors `Mcp-Method`, and for the operations that
+name a target `Mcp-Name`, into headers on the stateless path, using the
+specification's base64 sentinel when a value cannot be carried as plain ASCII.
+The values are derived from the body, never assumed: a mirror that disagrees
+with the body is a rejectable mismatch.
+
+### Changed
+- `ClientTransport` moved to `src/transport/client_transport.dart` so both
+  platform branches implement one type. `src/transport/transport.dart` is now a
+  barrel that resolves `StdioClientTransport` and `SseClientTransport` per
+  platform.
+- The auth / compressed / heartbeat SSE variants resolve through
+  `src/transport/legacy_sse.dart` instead of being exported individually.
+  `mcp_client.dart` exports the barrel; the class names it re-exports are
+  unchanged.
+
+### Fixed
+- On platforms without `dart:io`, constructing a transport that requires it now
+  fails with an explicit `McpError` naming the unsupported transport and
+  pointing at `StreamableHttpClientTransport`, instead of surfacing an opaque
+  platform error from deep inside the implementation. An unavailable capability
+  is reported, never silently substituted.
+- `example/mcp_client_example_2.dart` — non-English log strings replaced with
+  English.
+
 ## [2.1.0] - 2026-07-19 - 2025-11-25 conformance + 2026-07-28 stateless core (dormant)
 
 Additive, backward-compatible (all new fields optional/named; `==`/`hashCode`
