@@ -1,3 +1,21 @@
+## [2.2.0] - 2026-07-31
+
+### Added — headers that are fetched, not fixed
+
+`StreamableHttpTransportConfig.headers` is set when the transport is built and spread onto every request unchanged. Anything that expires cannot live there: a host holding a short-lived attestation or session credential has no way to attach it, because by the time a request goes out the value it captured is stale.
+
+`headersProvider` is asked on **every** outbound request — POST, the SSE GET stream, and the session-terminating DELETE — and receives `(url, method)` so one provider can serve several transports and decide per destination. `RequestHeadersProvider` and `reservedHeaderNames` are exported with the transport.
+
+Three properties make it safe to hand to host code, including a page script:
+
+- **It cannot break the exchange.** Names the protocol owns (`Content-Type`, `Accept`, `MCP-Session-Id`, `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, `Last-Event-ID`) are dropped rather than honoured, matched case-insensitively. A supplied `MCP-Session-Id` would otherwise fail the exchange in a way that reads as the server's fault.
+- **It cannot cost a request.** A provider that throws, or exceeds `headersProviderTimeout` (5s default), contributes nothing and the request goes without it. Failing the request instead would report a hook problem as an unreachable server. What the origin then says about the missing credential is the accurate answer, and it comes from the origin.
+- **Its failure is visible.** `lastHeadersProviderError` records the last one, because "the origin refused us" and "we never attached what the origin wanted" look identical on the wire and send a debugger to different places.
+
+Explicitly configured `headers` win over supplied ones: a host that set a value meant it, and the provider is the general case yielding to the specific one.
+
+Additive — no existing name or signature changed, and a transport with no provider behaves exactly as before. Ten regressions assert against a real socket, since the header map is assembled inside the transport and a mocked client would only be checking our own arrangement. Both guards mutation-checked.
+
 ## [2.1.1] - 2026-07-29 - Platform-conditional transports + specification conformance
 
 Two cuts. The transport split changes behavior only on platforms without

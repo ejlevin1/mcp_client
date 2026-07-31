@@ -18,6 +18,36 @@ import 'transport.dart';
 
 final Logger _logger = Logger('mcp_client.streamable_http_transport');
 
+/// Supplies headers for one outbound request.
+///
+/// Called per request, which is the point: [StreamableHttpTransportConfig.headers]
+/// is fixed when the transport is built, so anything that expires — an
+/// attestation token, a short-lived session credential — cannot live there. A
+/// host that has to *fetch* the value at call time needs this instead.
+///
+/// Receives the request being made so one provider can serve several
+/// transports and decide per destination.
+///
+/// Whatever it returns is added to the request, except the names the protocol
+/// owns (see [reservedHeaderNames]). Those are dropped rather than honoured: a
+/// supplied `MCP-Session-Id` or `Content-Type` would break the exchange in a
+/// way that looks like a server fault.
+typedef RequestHeadersProvider = FutureOr<Map<String, String>> Function(
+  ({String url, String method}) request,
+);
+
+/// Header names a provider may not set, because the transport's correctness
+/// depends on them.
+const Set<String> reservedHeaderNames = <String>{
+  'content-type',
+  'accept',
+  'mcp-session-id',
+  'mcp-protocol-version',
+  'mcp-method',
+  'mcp-name',
+  'last-event-id',
+};
+
 /// HTTP transport configuration
 @immutable
 class StreamableHttpTransportConfig {
@@ -27,8 +57,27 @@ class StreamableHttpTransportConfig {
   /// OAuth configuration (optional)
   final OAuthConfig? oauthConfig;
 
-  /// Additional headers to send with requests
+  /// Additional headers to send with requests.
+  ///
+  /// Fixed for the life of the transport. For a value that changes or expires,
+  /// use [headersProvider].
   final Map<String, String> headers;
+
+  /// Asked for headers on every request. See [RequestHeadersProvider].
+  ///
+  /// A provider that throws, or takes longer than [headersProviderTimeout],
+  /// contributes nothing and the request is sent without its headers. The
+  /// alternative — failing the request — would report a hook problem as an
+  /// unreachable server, and send whoever is looking at the screen to check
+  /// their network for something that is not there. What the origin then says
+  /// about the missing credential is the accurate answer, and it comes from
+  /// the origin.
+  final RequestHeadersProvider? headersProvider;
+
+  /// How long a provider may take before the request proceeds without it.
+  ///
+  /// A hang is worse than a failure: it has no error to report and no end.
+  final Duration headersProviderTimeout;
 
   /// Request timeout
   final Duration timeout;
@@ -49,6 +98,8 @@ class StreamableHttpTransportConfig {
     required this.baseUrl,
     this.oauthConfig,
     this.headers = const {},
+    this.headersProvider,
+    this.headersProviderTimeout = const Duration(seconds: 5),
     this.timeout = const Duration(seconds: 30),
     this.sseReadTimeout = const Duration(minutes: 5),
     this.maxConcurrentRequests = 10,
@@ -116,6 +167,8 @@ class StreamableHttpClientTransport implements ClientTransport {
     required String baseUrl,
     OAuthConfig? oauthConfig,
     Map<String, String>? headers,
+    RequestHeadersProvider? headersProvider,
+    Duration? headersProviderTimeout,
     Duration? timeout,
     int? maxConcurrentRequests,
     bool? useHttp2,
@@ -126,6 +179,9 @@ class StreamableHttpClientTransport implements ClientTransport {
       baseUrl: baseUrl,
       oauthConfig: oauthConfig,
       headers: headers ?? const {},
+      headersProvider: headersProvider,
+      headersProviderTimeout:
+          headersProviderTimeout ?? const Duration(seconds: 5),
       timeout: timeout ?? const Duration(seconds: 30),
       maxConcurrentRequests: maxConcurrentRequests ?? 10,
       useHttp2: useHttp2 ?? true,
@@ -214,6 +270,7 @@ class StreamableHttpClientTransport implements ClientTransport {
         'Content-Type': 'application/json',
         // StreamableHTTP standard requires accepting both content types
         'Accept': 'application/json, text/event-stream',
+        ...await _providedHeaders('POST'),
         ...config.headers,
       };
 
@@ -476,6 +533,7 @@ class StreamableHttpClientTransport implements ClientTransport {
       final headers = <String, String>{
         'Accept': 'text/event-stream',
         'Cache-Control': 'no-cache',
+        ...await _providedHeaders('GET'),
         ...config.headers,
       };
       
@@ -560,6 +618,48 @@ class StreamableHttpClientTransport implements ClientTransport {
     }
   }
 
+
+  /// Headers a provider contributed for this request, minus the ones the
+  /// protocol owns.
+  ///
+  /// Never throws and never hangs. A provider is host-supplied code — often a
+  /// page script reaching for a token — and a request must not be lost to it.
+  Future<Map<String, String>> _providedHeaders(String method) async {
+    final provider = config.headersProvider;
+    if (provider == null) return const <String, String>{};
+    try {
+      final supplied = await Future<Map<String, String>>.value(
+        provider((url: config.baseUrl, method: method)),
+      ).timeout(config.headersProviderTimeout);
+      final allowed = <String, String>{};
+      for (final entry in supplied.entries) {
+        if (reservedHeaderNames.contains(entry.key.toLowerCase())) {
+          // Silently honouring it would break the exchange in a way that
+          // looks like the server's fault, so say which name was dropped.
+          _logger.debug(
+              'headers provider tried to set reserved header "${entry.key}"; '
+              'ignored');
+          continue;
+        }
+        allowed[entry.key] = entry.value;
+      }
+      return allowed;
+    } catch (e) {
+      // Reported, not fatal. The origin's answer to a request missing its
+      // credential is the accurate thing to show, and it comes from the origin.
+      _logger.debug('headers provider failed ($e); sending without it');
+      lastHeadersProviderError = e;
+      return const <String, String>{};
+    }
+  }
+
+  /// The last failure from [StreamableHttpTransportConfig.headersProvider].
+  ///
+  /// Exposed so a host can tell "the origin refused us" from "we never
+  /// attached what the origin wanted" — those look identical on the wire and
+  /// send whoever is debugging to different places.
+  Object? lastHeadersProviderError;
+
   /// Terminate the session
   Future<void> _terminateSession() async {
     if (_sessionId == null) return;
@@ -567,6 +667,7 @@ class StreamableHttpClientTransport implements ClientTransport {
     try {
       final headers = <String, String>{
         'MCP-Session-Id': _sessionId!,
+        ...await _providedHeaders('DELETE'),
         ...config.headers,
       };
 
