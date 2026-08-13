@@ -161,7 +161,12 @@ class Client {
     _connecting = true;
     _statelessMode = statelessMode;
     _transport = transport;
-    _transport!.onMessage.listen(_handleMessage);
+    // `onError` is load-bearing. A transport reports a wire failure by adding
+    // an error to this stream (an HTTP POST to a closed port, a dropped
+    // socket). Listening without a handler left that error unhandled and the
+    // request completers untouched, so a request on a dead endpoint waited out
+    // its 30-second timeout instead of failing when the wire did.
+    _transport!.onMessage.listen(_handleMessage, onError: _handleTransportError);
     _transport!.onClose
         .then((_) {
           // Only send disconnect event if we're still connected
@@ -223,6 +228,24 @@ class Client {
       _errorStreamController.add(McpError('Initialization error: $e'));
       disconnect();
       rethrow;
+    }
+  }
+
+  /// Fails everything in flight when the wire under it fails.
+  ///
+  /// Nothing will answer a request whose transport just reported an error, so
+  /// the completers are resolved here rather than left to time out. This is
+  /// what makes `connect` on an unreachable endpoint return an error at the
+  /// speed the socket failed.
+  void _handleTransportError(Object error) {
+    final err =
+        error is McpError ? error : McpError('Transport error: $error');
+    if (!_errorStreamController.isClosed) _errorStreamController.add(err);
+    if (_requestCompleters.isEmpty) return;
+    final pending = List.of(_requestCompleters.values);
+    _requestCompleters.clear();
+    for (final completer in pending) {
+      if (!completer.isCompleted) completer.completeError(err);
     }
   }
 

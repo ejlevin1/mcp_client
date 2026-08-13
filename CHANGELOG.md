@@ -1,3 +1,11 @@
+## 2.2.1
+
+### Fixed
+- `Client.connect` fails when the transport reports a wire error instead of
+  waiting out the 30-second request timeout. Requests in flight are completed
+  with that error rather than left pending. An unreachable endpoint now fails
+  in milliseconds.
+
 ## [2.2.0] - 2026-07-31
 
 ### Added — headers that are fetched, not fixed
