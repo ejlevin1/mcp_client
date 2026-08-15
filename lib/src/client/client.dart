@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import '../../logger.dart';
 import '../models/models.dart';
@@ -12,6 +13,22 @@ import '../transport/streamable_http_transport.dart';
 import '../transport/transport.dart';
 
 final Logger _logger = Logger('mcp_client.client');
+
+final Random _progressTokenRandom = Random();
+
+/// Mint a fresh `_meta.progressToken` (32 lowercase hex chars).
+///
+/// Uniqueness only has to hold across this client's own in-flight requests, so
+/// a non-cryptographic source is sufficient.
+String _newProgressToken() {
+  final buffer = StringBuffer();
+  for (var i = 0; i < 8; i++) {
+    buffer.write(
+      _progressTokenRandom.nextInt(0x10000).toRadixString(16).padLeft(4, '0'),
+    );
+  }
+  return buffer.toString();
+}
 
 /// Main MCP Client class that handles all client-side protocol operations
 class Client {
@@ -61,11 +78,17 @@ class Client {
   /// Request identifier counter
   int _requestId = 1;
 
-  /// Map of request completion handlers by ID
-  final _requestCompleters = <int, Completer<dynamic>>{};
+  /// In-flight requests by JSON-RPC id. Each entry owns its completer, its
+  /// `_meta.progressToken` (for progress correlation) and BOTH of its clocks —
+  /// see [_PendingRequest].
+  final _pendingRequests = <int, _PendingRequest>{};
 
   /// Map of notification handlers by method
   final _notificationHandlers = <String, Function(Map<String, dynamic>)>{};
+
+  /// Global `notifications/progress` listener registered via [onProgress].
+  /// Fires for every progress notification, correlated or not.
+  void Function(McpProgress progress)? _globalProgressHandler;
 
   /// Map of incoming-request handlers by method (server-initiated requests
   /// per spec: `sampling/createMessage`, `roots/list`, `elicitation/create`).
@@ -510,6 +533,12 @@ class Client {
   // semantics: the deadline is computed once at the top of the public method
   // and threaded into the MRTR loop.
   //
+  // [callTool] additionally offers the IDLE clock (`idleTimeout`), reset by
+  // correlated `notifications/progress`. It is deliberately NOT offered on the
+  // other methods: only a tool call runs long enough to report progress, and
+  // only a tool call carries a `_meta.progressToken` for the correlation. A
+  // list/read/get either answers promptly or is broken.
+  //
   // `cancellationToken` is offered on the 10 methods that reach
   // [_sendRequest] / [_sendRequestWithMrtr] on behalf of a caller:
   // [listTools], [callTool], [listResources], [readResource],
@@ -548,15 +577,39 @@ class Client {
 
   /// Call a tool on the server.
   ///
-  /// [timeout] overrides [defaultRequestTimeout] for this call. The resulting
-  /// deadline is the budget for the WHOLE call, including every
-  /// Multi-Round-Trip round on the stateless path.
+  /// The call runs under TWO independent clocks:
+  ///
+  ///  * the MAX clock — [maxTimeout] (or [timeout], or [defaultRequestTimeout])
+  ///    measured from send time and NEVER reset. It is the budget for the WHOLE
+  ///    call, including every Multi-Round-Trip round on the stateless path, so
+  ///    a server that streams progress forever still hits a hard ceiling.
+  ///  * the IDLE clock — optional [idleTimeout], reset every time a
+  ///    `notifications/progress` carrying this call's `progressToken` arrives.
+  ///    A tool that keeps reporting progress keeps running; one that goes quiet
+  ///    for longer than [idleTimeout] fails.
+  ///
+  /// Whichever clock expires first fails the call with an [McpError] naming
+  /// that clock and emits `notifications/cancelled` for the original request
+  /// id. Passing no [idleTimeout] leaves the MAX clock as the only deadline.
+  ///
+  /// [maxTimeout] and [timeout] are the same clock; [maxTimeout] wins when both
+  /// are given and reads better alongside [idleTimeout].
+  ///
+  /// [progressToken] overrides the token written to `_meta.progressToken`; when
+  /// null a fresh one is minted. [onProgress] receives every progress
+  /// notification correlated to THIS call (the client-wide [onProgress]
+  /// listener still fires too).
+  ///
   /// [cancellationToken] lets the caller abort the in-flight request; see
   /// [McpCancellationToken].
   Future<CallToolResult> callTool(
     String name,
     Map<String, dynamic> toolArguments, {
     Duration? timeout,
+    Duration? idleTimeout,
+    Duration? maxTimeout,
+    Object? progressToken,
+    void Function(McpProgress progress)? onProgress,
     McpCancellationToken? cancellationToken,
   }) async {
     if (!_initialized) {
@@ -567,27 +620,38 @@ class Client {
       throw McpError('Server does not support tools');
     }
 
-    // Create a clean params map with properly typed values
+    // Create a clean params map with properly typed values. The server echoes
+    // `_meta.progressToken` on every `notifications/progress`; it is the only
+    // thing tying a progress notification back to this call, and therefore to
+    // this call's idle clock.
     final Map<String, dynamic> params = {
       'name': name,
       'arguments': Map<String, dynamic>.from(toolArguments),
+      '_meta': <String, dynamic>{
+        'progressToken': progressToken ?? _newProgressToken(),
+      },
     };
 
     // 2026-07-28 (SEP-2577): a stateless `tools/call` may return
     // `input_required`; the MRTR driver fulfills the server's input requests and
     // re-issues until a terminal result. Legacy path = a single request.
-    final deadline = DateTime.now().add(timeout ?? defaultRequestTimeout);
+    final deadline =
+        DateTime.now().add(maxTimeout ?? timeout ?? defaultRequestTimeout);
     final response = _statelessMode
         ? await _sendRequestWithMrtr(
             'tools/call',
             params,
             deadline: deadline,
+            idleTimeout: idleTimeout,
+            onProgress: onProgress,
             cancellationToken: cancellationToken,
           )
         : await _sendRequest(
             'tools/call',
             params,
             deadline: deadline,
+            idleTimeout: idleTimeout,
+            onProgress: onProgress,
             cancellationToken: cancellationToken,
           );
     return CallToolResult.fromJson(response);
@@ -1114,22 +1178,24 @@ class Client {
     });
   }
 
-  /// Register a handler for progress updates from the server
+  /// Register a client-wide listener for `notifications/progress`.
   ///
-  /// The handler will be called with:
-  /// [requestId] - The ID of the request that this progress update relates to
-  /// [progress] - A value between 0.0 and 1.0 indicating the progress
-  /// [message] - Optional message describing the current progress state
-  void onProgress(
-    Function(String requestId, double progress, String message) handler,
-  ) {
-    onNotification(McpProtocol.methodProgress, (params) {
-      final requestId =
-          params['requestId'] as String? ?? params['request_id'] as String;
-      final progress = params['progress'] as double;
-      final message = params['message'] as String;
-      handler(requestId, progress, message);
-    });
+  /// Fires for EVERY progress notification the server sends, whether or not it
+  /// correlates to a request this client still has in flight. For progress
+  /// scoped to one call — and for driving that call's idle clock — pass
+  /// `onProgress` to [callTool] instead.
+  ///
+  /// Registering a listener does NOT displace the internal progress dispatcher:
+  /// correlated notifications still re-arm their request's idle timer.
+  ///
+  /// BREAKING (fork): the pre-fork signature was
+  /// `(String requestId, double progress, String message)`. It keyed on a
+  /// `requestId` field the spec does not define (the spec correlates on
+  /// `progressToken`) and its casts threw on the spec-legal payload — integer
+  /// `progress`, absent `message`, absent `total`. The parsed [McpProgress]
+  /// replaces it.
+  void onProgress(void Function(McpProgress progress) handler) {
+    _globalProgressHandler = handler;
   }
 
   // `onSamplingResponse` (non-spec `sampling/response` notification) was
@@ -1212,12 +1278,15 @@ class Client {
     _transport = null;
     _initialized = false;
 
-    // Complete any pending requests with an error
-    final pending = List<Completer<dynamic>>.from(_requestCompleters.values);
-    _requestCompleters.clear();
-    for (final completer in pending) {
-      if (!completer.isCompleted) {
-        completer.completeError(McpError('Transport disconnected'));
+    // Complete any pending requests with an error, stopping both of their
+    // clocks — a disconnected request must not linger as a live timer, nor
+    // later fire and emit a `notifications/cancelled` down a dead transport.
+    final pending = List<_PendingRequest>.from(_pendingRequests.values);
+    _pendingRequests.clear();
+    for (final request in pending) {
+      request.cancelTimers();
+      if (!request.completer.isCompleted) {
+        request.completer.completeError(McpError('Transport disconnected'));
       }
     }
 
@@ -1334,21 +1403,25 @@ class Client {
       if (!sub.controller.isClosed) sub.controller.close();
       return;
     }
-    if (id == null || id is! int || !_requestCompleters.containsKey(id)) {
+    if (id == null || id is! int || !_pendingRequests.containsKey(id)) {
+      // Also the path a response takes when it arrives AFTER its request timed
+      // out: the timeout removed the entry, so the late result is dropped
+      // instead of completing an already-failed future.
       _logger.debug('Received response with unknown id: $id');
       return;
     }
 
-    final completer = _requestCompleters.remove(id)!;
+    final pending = _pendingRequests.remove(id)!;
+    pending.cancelTimers();
 
     if (response.error != null) {
       final code = response.error!['code'] as int;
       final message = response.error!['message'] as String;
       final error = McpError(message, code: code);
       _errorStreamController.add(error);
-      completer.completeError(error);
+      pending.completer.completeError(error);
     } else {
-      completer.complete(response.result);
+      pending.completer.complete(response.result);
     }
   }
 
@@ -1382,6 +1455,14 @@ class Client {
       return;
     }
 
+    // Progress is dispatched by the built-in correlator, not through the
+    // by-method handler registry, so a caller registering their own
+    // `notifications/progress` handler can never displace idle-clock re-arming.
+    // The registry handler below still runs afterwards.
+    if (method == McpProtocol.methodProgress) {
+      _dispatchProgress(Map<String, dynamic>.from(params));
+    }
+
     final handler = _notificationHandlers[method];
     if (handler != null) {
       try {
@@ -1392,18 +1473,83 @@ class Client {
           McpError('Error in notification handler: $e'),
         );
       }
-    } else {
+    } else if (method != McpProtocol.methodProgress) {
       _logger.debug('No handler for notification: $method');
     }
   }
 
-  /// Send a JSON-RPC request.
+  /// Correlate and dispatch one `notifications/progress` payload.
   ///
-  /// [deadline] is the absolute wall-clock instant this request must finish
-  /// by. It is computed ONCE by the public entry point and threaded down so a
-  /// Multi-Round-Trip exchange consumes a single shared budget instead of
-  /// restarting the clock on every round. When null, the deadline is
-  /// [defaultRequestTimeout] from now.
+  /// The spec payload is `{progressToken, progress, total?, message?}`. The
+  /// token is matched against the `_meta.progressToken` of every in-flight
+  /// request; the ONE match (if any) gets:
+  ///  * its IDLE clock re-armed — the MAX clock is deliberately left alone, so
+  ///    progress can extend a call's quiet period but never its hard ceiling;
+  ///  * its per-call `onProgress` invoked.
+  ///
+  /// An unknown or stale token is a no-op (debug log only): a server may
+  /// legitimately emit progress for a request this client already abandoned,
+  /// and that must not disturb any other call.
+  void _dispatchProgress(Map<String, dynamic> params) {
+    final progress = McpProgress.tryParse(params);
+    if (progress == null) {
+      _logger.debug('Ignoring malformed notifications/progress: $params');
+      return;
+    }
+
+    _PendingRequest? matched;
+    for (final request in _pendingRequests.values) {
+      if (request.progressToken != null &&
+          request.progressToken == progress.progressToken) {
+        matched = request;
+        break;
+      }
+    }
+
+    if (matched == null) {
+      _logger.debug(
+        'No in-flight request for progressToken ${progress.progressToken}',
+      );
+    } else {
+      matched.rearmIdle();
+      _notifyProgressListener(matched.onProgress, progress);
+    }
+
+    _notifyProgressListener(_globalProgressHandler, progress);
+  }
+
+  /// Invoke a progress listener without letting a throwing listener escape into
+  /// the transport's message pump or block the other listener.
+  void _notifyProgressListener(
+    void Function(McpProgress progress)? listener,
+    McpProgress progress,
+  ) {
+    if (listener == null) return;
+    try {
+      listener(progress);
+    } catch (e) {
+      _logger.debug('Error in progress handler: $e');
+      _errorStreamController.add(McpError('Error in progress handler: $e'));
+    }
+  }
+
+  /// Send a JSON-RPC request under two independent clocks.
+  ///
+  /// [deadline] is the MAX clock: the absolute wall-clock instant this request
+  /// must finish by, computed ONCE by the public entry point and threaded down
+  /// so a Multi-Round-Trip exchange consumes a single shared budget instead of
+  /// restarting the clock on every round. It is never extended by progress.
+  /// When null it is [defaultRequestTimeout] from now.
+  ///
+  /// [idleTimeout] is the IDLE clock: the maximum quiet period allowed between
+  /// `notifications/progress` messages carrying this request's
+  /// `_meta.progressToken`. Every matching notification restarts it. Null (the
+  /// default) means no idle clock — the MAX clock is the only deadline.
+  ///
+  /// The progress token is read out of `params['_meta']['progressToken']` (set
+  /// by the public entry point) rather than passed separately, so the token on
+  /// the wire and the token used for correlation cannot drift apart.
+  /// [onProgress] receives each correlated notification.
   ///
   /// [cancellationToken] is bound to the freshly minted request id
   /// SYNCHRONOUSLY, before the first `await` and before the request is sent, so
@@ -1413,6 +1559,8 @@ class Client {
     String method,
     Map<String, dynamic> params, {
     DateTime? deadline,
+    Duration? idleTimeout,
+    void Function(McpProgress progress)? onProgress,
     McpCancellationToken? cancellationToken,
   }) async {
     if (!isConnected) {
@@ -1421,36 +1569,6 @@ class Client {
 
     final effectiveDeadline =
         deadline ?? DateTime.now().add(defaultRequestTimeout);
-
-    final id = _requestId++;
-    final completer = Completer<dynamic>();
-    _requestCompleters[id] = completer;
-
-    // Bind the token to this id before anything asynchronous happens. `_bind`
-    // returns false when the token was already cancelled (item 3: pre-bind
-    // latch) — in that case the request is never sent.
-    if (cancellationToken != null) {
-      final bound = cancellationToken._bind(() {
-        final pending = _requestCompleters.remove(id);
-        // Tell the server to stop working on it. Never throws.
-        notifyCancelled(id, reason: cancellationToken.reason);
-        if (pending != null && !pending.isCompleted) {
-          final error = McpError(
-            'Request cancelled: $method'
-            '${cancellationToken.reason != null ? ' (${cancellationToken.reason})' : ''}',
-          );
-          _errorStreamController.add(error);
-          pending.completeError(error);
-        }
-      });
-      if (!bound) {
-        _requestCompleters.remove(id);
-        throw McpError(
-          'Request cancelled before dispatch: $method'
-          '${cancellationToken.reason != null ? ' (${cancellationToken.reason})' : ''}',
-        );
-      }
-    }
 
     // Create a deep copy of params to avoid potential modification issues
     final Map<String, dynamic> safeParams = Map<String, dynamic>.from(params);
@@ -1463,6 +1581,44 @@ class Client {
     if (_statelessMode) {
       safeParams['_meta'] = _statelessMeta(safeParams['_meta']);
     }
+    final meta = safeParams['_meta'];
+    final progressToken = meta is Map ? meta['progressToken'] : null;
+
+    final id = _requestId++;
+    final pending = _PendingRequest(
+      completer: Completer<dynamic>(),
+      method: method,
+      progressToken: progressToken,
+      onProgress: onProgress,
+    );
+    _pendingRequests[id] = pending;
+
+    // Bind the token to this id before anything asynchronous happens. `_bind`
+    // returns false when the token was already cancelled (item 3: pre-bind
+    // latch) — in that case the request is never sent.
+    if (cancellationToken != null) {
+      final bound = cancellationToken._bind(() {
+        final cancelled = _pendingRequests.remove(id);
+        cancelled?.cancelTimers();
+        // Tell the server to stop working on it. Never throws.
+        notifyCancelled(id, reason: cancellationToken.reason);
+        if (cancelled != null && !cancelled.completer.isCompleted) {
+          final error = McpError(
+            'Request cancelled: $method'
+            '${cancellationToken.reason != null ? ' (${cancellationToken.reason})' : ''}',
+          );
+          _errorStreamController.add(error);
+          cancelled.completer.completeError(error);
+        }
+      });
+      if (!bound) {
+        _pendingRequests.remove(id);
+        throw McpError(
+          'Request cancelled before dispatch: $method'
+          '${cancellationToken.reason != null ? ' (${cancellationToken.reason})' : ''}',
+        );
+      }
+    }
 
     final request = {
       'jsonrpc': McpProtocol.jsonRpcVersion,
@@ -1474,7 +1630,9 @@ class Client {
     try {
       _transport!.send(request);
     } catch (e) {
-      _requestCompleters.remove(id);
+      // No clock is running yet — the timers are armed below, inside the try
+      // whose finally cancels them, so this path cannot leak one.
+      _pendingRequests.remove(id);
       cancellationToken?._unbind();
       final error = McpError('Failed to send request: $e');
       _errorStreamController.add(error);
@@ -1482,22 +1640,18 @@ class Client {
     }
 
     try {
-      // Remaining slice of the shared deadline (never negative — a deadline
-      // already in the past fires immediately).
-      final remaining = effectiveDeadline.difference(DateTime.now());
-      final result = await completer.future.timeout(
-        remaining.isNegative ? Duration.zero : remaining,
-        onTimeout: () {
-          _requestCompleters.remove(id);
-          // Best-effort: tell the server to stop working on the abandoned
-          // request. Never throws.
-          notifyCancelled(id, reason: 'timeout');
-          final error = McpError('Request timed out: $method');
-          _errorStreamController.add(error);
-          throw error;
-        },
+      // MAX clock: remaining slice of the shared deadline (never negative — a
+      // deadline already in the past fires immediately). Never re-armed.
+      pending.armMax(
+        effectiveDeadline.difference(DateTime.now()),
+        () => _failTimedOut(id, _timeoutClockMax),
       );
-      return result;
+      // IDLE clock: restarted by every correlated progress notification.
+      pending.armIdle(
+        idleTimeout,
+        () => _failTimedOut(id, _timeoutClockIdle),
+      );
+      return await pending.completer.future;
     } catch (e) {
       if (e is! McpError) {
         final error = McpError('Request failed: $e');
@@ -1506,9 +1660,39 @@ class Client {
       }
       rethrow;
     } finally {
+      pending.cancelTimers();
       // The id is no longer in flight; a later cancel() on the same token must
       // not emit a stale `notifications/cancelled` for it.
       cancellationToken?._unbind();
+    }
+  }
+
+  /// Name of the clock in a timeout error message: the fixed budget measured
+  /// from send time.
+  static const String _timeoutClockMax = 'max';
+
+  /// Name of the clock in a timeout error message: the quiet period between
+  /// correlated progress notifications.
+  static const String _timeoutClockIdle = 'idle';
+
+  /// Fail request [id] because its [clock] expired.
+  ///
+  /// Guarded on the pending map: a request that already settled — response,
+  /// error, cancellation, disconnect, or the OTHER clock — is no longer there,
+  /// so a late timer fire can never emit a stale `notifications/cancelled` or
+  /// double-complete. This is also what makes "exactly one cancel notification
+  /// per timed-out request" hold when both clocks are close together.
+  void _failTimedOut(int id, String clock) {
+    final pending = _pendingRequests.remove(id);
+    if (pending == null) return;
+    pending.cancelTimers();
+    // Best-effort: tell the server to stop working on the abandoned request.
+    // Never throws.
+    notifyCancelled(id, reason: 'timeout ($clock)');
+    final error = McpError('Request timed out ($clock): ${pending.method}');
+    _errorStreamController.add(error);
+    if (!pending.completer.isCompleted) {
+      pending.completer.completeError(error);
     }
   }
 
@@ -1542,10 +1726,18 @@ class Client {
   /// public entry point (or here, from [defaultRequestTimeout], if the caller
   /// passed none). Rounds must never each get a fresh full timeout, or a caller
   /// asking for N seconds could wait up to [_mrtrMaxRounds] × N.
+  ///
+  /// [idleTimeout] is per ROUND, not shared: each round puts a new request on
+  /// the wire, so its quiet period starts over. The MAX clock still bounds the
+  /// whole exchange. [onProgress] is forwarded to every round; the caller's
+  /// `_meta.progressToken` rides along in [params] and is therefore preserved
+  /// across re-issues.
   Future<Map<String, dynamic>> _sendRequestWithMrtr(
     String method,
     Map<String, dynamic> params, {
     DateTime? deadline,
+    Duration? idleTimeout,
+    void Function(McpProgress progress)? onProgress,
     McpCancellationToken? cancellationToken,
   }) async {
     final effectiveDeadline =
@@ -1556,6 +1748,8 @@ class Client {
         method,
         currentParams,
         deadline: effectiveDeadline,
+        idleTimeout: idleTimeout,
+        onProgress: onProgress,
         cancellationToken: cancellationToken,
       );
       final result = raw is Map<String, dynamic>
@@ -1725,6 +1919,142 @@ class McpCancellationToken {
   /// Detach the handler once the bound request is no longer in flight.
   void _unbind() {
     _onCancel = null;
+  }
+}
+
+/// A parsed `notifications/progress` payload.
+///
+/// Spec shape (2025-03-26+): `{progressToken, progress, total?, message?}`.
+/// [progress] and [total] are `num` — the spec allows both integers and
+/// floats, and a client that insists on `double` throws on a perfectly legal
+/// `"progress": 3`. [total] and [message] are optional and frequently absent.
+class McpProgress {
+  /// The token the server echoed from the originating request's
+  /// `_meta.progressToken`. Typed `Object` because the spec allows a string or
+  /// a number and the value must be compared as sent, never stringified.
+  final Object progressToken;
+
+  /// Work completed so far. Monotonically increasing per spec, but NOT
+  /// normalized to 0..1 — read it against [total] when one is supplied.
+  final num progress;
+
+  /// Total work, when the server knows it.
+  final num? total;
+
+  /// Human-readable description of the current step, when supplied.
+  final String? message;
+
+  const McpProgress({
+    required this.progressToken,
+    required this.progress,
+    this.total,
+    this.message,
+  });
+
+  /// [progress] as a 0..1 fraction when [total] is known and positive; null
+  /// otherwise (an unbounded progress stream has no fraction).
+  double? get fraction =>
+      total != null && total! > 0 ? progress / total! : null;
+
+  /// Parse a spec `notifications/progress` `params` map.
+  ///
+  /// Deliberately tolerant: returns null instead of throwing when the payload
+  /// lacks a usable `progressToken` / `progress` pair, and ignores rather than
+  /// rejects wrongly-typed optional fields. A malformed notification from one
+  /// server must not take down the client's message pump.
+  static McpProgress? tryParse(Map<String, dynamic> params) {
+    final token = params['progressToken'];
+    final progress = params['progress'];
+    if (token == null || progress is! num) return null;
+    final total = params['total'];
+    final message = params['message'];
+    return McpProgress(
+      progressToken: token,
+      progress: progress,
+      total: total is num ? total : null,
+      message: message is String ? message : null,
+    );
+  }
+
+  @override
+  String toString() =>
+      'McpProgress(progressToken: $progressToken, progress: $progress, '
+      'total: $total, message: $message)';
+}
+
+/// Internal bookkeeping for one in-flight JSON-RPC request.
+///
+/// Owns BOTH per-call clocks, which are independent by design:
+///
+///  * the IDLE timer is re-armed by every `notifications/progress` whose
+///    `progressToken` matches [progressToken] — a tool that keeps reporting
+///    keeps running;
+///  * the MAX timer is armed once at send time and NEVER re-armed — a tool that
+///    reports progress forever still hits a hard ceiling.
+///
+/// Both are cancelled together on every exit path (response, error, cancel,
+/// disconnect, and the other clock firing) via [cancelTimers].
+class _PendingRequest {
+  _PendingRequest({
+    required this.completer,
+    required this.method,
+    required this.progressToken,
+    required this.onProgress,
+  });
+
+  /// Completed by the response handler, the cancellation path, a timer, or
+  /// disconnect — whichever happens first.
+  final Completer<dynamic> completer;
+
+  /// Request method, used to name the request in timeout errors.
+  final String method;
+
+  /// `_meta.progressToken` sent with this request, or null when the request
+  /// did not opt into progress (every method except `tools/call` today). Only
+  /// a notification carrying an equal token re-arms the idle clock.
+  final Object? progressToken;
+
+  /// Per-call progress listener supplied by the caller.
+  final void Function(McpProgress progress)? onProgress;
+
+  Timer? _idleTimer;
+  Timer? _maxTimer;
+  Duration? _idleTimeout;
+  void Function()? _onIdleExpired;
+
+  /// Arm the idle clock. No-op when [idleTimeout] is null — the caller did not
+  /// ask for one, so progress notifications only feed [onProgress].
+  void armIdle(Duration? idleTimeout, void Function() onExpired) {
+    if (idleTimeout == null) return;
+    _idleTimeout = idleTimeout;
+    _onIdleExpired = onExpired;
+    _idleTimer = Timer(idleTimeout, onExpired);
+  }
+
+  /// Arm the absolute clock with the [remaining] slice of the shared deadline.
+  /// A deadline already in the past fires on the next turn rather than never.
+  void armMax(Duration remaining, void Function() onExpired) {
+    _maxTimer = Timer(
+      remaining.isNegative ? Duration.zero : remaining,
+      onExpired,
+    );
+  }
+
+  /// Restart the idle clock from now. No-op when no idle clock is armed.
+  void rearmIdle() {
+    final idleTimeout = _idleTimeout;
+    final onExpired = _onIdleExpired;
+    if (idleTimeout == null || onExpired == null) return;
+    _idleTimer?.cancel();
+    _idleTimer = Timer(idleTimeout, onExpired);
+  }
+
+  /// Stop both clocks. Idempotent — safe to call from every exit path.
+  void cancelTimers() {
+    _idleTimer?.cancel();
+    _idleTimer = null;
+    _maxTimer?.cancel();
+    _maxTimer = null;
   }
 }
 

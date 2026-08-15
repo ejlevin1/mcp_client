@@ -205,9 +205,21 @@ final trackingResult = await client.callToolWithTracking('long-running-operation
 });
 final operationId = trackingResult.operationId;
 
-// Listen to inbound progress notifications from the server
-client.onProgress((requestId, progress, message) {
-  _logger.debug('Operation $requestId: $progress% - $message');
+// Call a tool under two independent clocks: the idle clock is reset by every
+// `notifications/progress` carrying this call's progressToken, while the max
+// clock is fixed at send time and never reset. Whichever expires first fails
+// the call and emits `notifications/cancelled` for the original request id.
+final longResult = await client.callTool(
+  'long-running-operation',
+  {'parameter': 'value'},
+  idleTimeout: const Duration(minutes: 2),   // quiet period between updates
+  maxTimeout: const Duration(minutes: 30),   // hard ceiling from send time
+  onProgress: (p) => _logger.debug('${p.progress}/${p.total} — ${p.message}'),
+);
+
+// Listen to every inbound progress notification, correlated or not.
+client.onProgress((progress) {
+  _logger.debug('Token ${progress.progressToken}: ${progress.progress}');
 });
 
 // Process the result

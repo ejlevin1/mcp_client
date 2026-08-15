@@ -320,16 +320,13 @@ void main() {
         },
       });
 
-      // Prepare to listen for progress
+      // Prepare to listen for progress. The spec payload keys on
+      // `progressToken` — never `requestId`.
       final progressReceived = Completer<bool>();
-      String? receivedRequestId;
-      double? receivedProgress;
-      String? receivedMessage;
+      McpProgress? received;
 
-      client.onProgress((requestId, progress, message) {
-        receivedRequestId = requestId;
-        receivedProgress = progress;
-        receivedMessage = message;
+      client.onProgress((progress) {
+        received = progress;
         progressReceived.complete(true);
       });
 
@@ -341,17 +338,20 @@ void main() {
         'jsonrpc': McpProtocol.jsonRpcVersion,
         'method': McpProtocol.methodProgress,
         'params': {
-          'requestId': 'req-123',
+          'progressToken': 'req-123',
           'progress': 0.75,
+          'total': 1,
           'message': '75% complete',
         },
       });
 
       // Verify progress notification was received
       await progressReceived.future.timeout(const Duration(seconds: 1));
-      expect(receivedRequestId, equals('req-123'));
-      expect(receivedProgress, equals(0.75));
-      expect(receivedMessage, equals('75% complete'));
+      expect(received!.progressToken, equals('req-123'));
+      expect(received!.progress, equals(0.75));
+      expect(received!.total, equals(1));
+      expect(received!.message, equals('75% complete'));
+      expect(received!.fraction, equals(0.75));
     });
 
     test('Client handles resource subscriptions', () async {
