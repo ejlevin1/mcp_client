@@ -265,6 +265,10 @@ class McpClient {
       version: config.version,
       description: config.description,
       capabilities: config.capabilities,
+      // Previously dropped on the floor: `requestTimeout` was declared,
+      // copied, compared, hashed and printed on the config but never reached
+      // the client, so `productionConfig()`'s advertised 60s did nothing.
+      defaultRequestTimeout: config.requestTimeout,
     );
   }
 

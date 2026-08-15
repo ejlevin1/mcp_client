@@ -29,6 +29,16 @@ class Client {
   /// Client capabilities configuration
   final ClientCapabilities capabilities;
 
+  /// Default wall-clock budget for a single logical request issued by this
+  /// client. Applies to every method that reaches [_sendRequest] /
+  /// [_sendRequestWithMrtr] unless the caller supplies an explicit `timeout`.
+  ///
+  /// This is a TOTAL budget per public call, not a per-round-trip budget: the
+  /// deadline is computed once at the top of the public method and threaded
+  /// down, so a Multi-Round-Trip (`input_required`) exchange cannot multiply
+  /// it by the number of rounds.
+  final Duration defaultRequestTimeout;
+
   /// Protocol version this client implements
   final String protocolVersion = McpProtocol.defaultVersion;
 
@@ -121,6 +131,7 @@ class Client {
     required this.version,
     this.description,
     this.capabilities = const ClientCapabilities(),
+    this.defaultRequestTimeout = const Duration(seconds: 30),
   }) {
     // Default `roots/list` handler returns the locally registered roots.
     // Hosts may override with [onListRoots] for dynamic roots.
@@ -487,8 +498,35 @@ class Client {
     }
   }
 
-  /// List available tools on the server
-  Future<List<Tool>> listTools() async {
+  // ── Per-call timeout / cancellation surface ───────────────────────────────
+  //
+  // `timeout` (explicit per-call override of [defaultRequestTimeout]) is
+  // offered on [listTools] and [callTool] only — the two methods a host driving
+  // a child MCP server needs to bound independently. Every other request-issuing
+  // method ([listResources], [readResource], [listResourceTemplates],
+  // [subscribeResource], [unsubscribeResource], [listPrompts], [getPrompt],
+  // [setLoggingLevel], plus [initialize] / [discover] / the `tasks/*` calls)
+  // uses [defaultRequestTimeout]. They still get the correct single-deadline
+  // semantics: the deadline is computed once at the top of the public method
+  // and threaded into the MRTR loop.
+  //
+  // `cancellationToken` is offered on the 10 methods that reach
+  // [_sendRequest] / [_sendRequestWithMrtr] on behalf of a caller:
+  // [listTools], [callTool], [listResources], [readResource],
+  // [listResourceTemplates], [subscribeResource], [unsubscribeResource],
+  // [listPrompts], [getPrompt], [setLoggingLevel]. Handshake/lifecycle calls
+  // ([initialize], `notifications/initialized`, ping) are deliberately NOT
+  // cancellable.
+
+  /// List available tools on the server.
+  ///
+  /// [timeout] overrides [defaultRequestTimeout] for this call.
+  /// [cancellationToken] lets the caller abort the in-flight request; see
+  /// [McpCancellationToken].
+  Future<List<Tool>> listTools({
+    Duration? timeout,
+    McpCancellationToken? cancellationToken,
+  }) async {
     if (!_initialized) {
       throw McpError('Client is not initialized');
     }
@@ -497,16 +535,30 @@ class Client {
       throw McpError('Server does not support tools');
     }
 
-    final response = await _sendRequest('tools/list', {});
+    final deadline = DateTime.now().add(timeout ?? defaultRequestTimeout);
+    final response = await _sendRequest(
+      'tools/list',
+      {},
+      deadline: deadline,
+      cancellationToken: cancellationToken,
+    );
     final toolsList = response['tools'] as List<dynamic>;
     return toolsList.map((tool) => Tool.fromJson(tool)).toList();
   }
 
-  /// Call a tool on the server
+  /// Call a tool on the server.
+  ///
+  /// [timeout] overrides [defaultRequestTimeout] for this call. The resulting
+  /// deadline is the budget for the WHOLE call, including every
+  /// Multi-Round-Trip round on the stateless path.
+  /// [cancellationToken] lets the caller abort the in-flight request; see
+  /// [McpCancellationToken].
   Future<CallToolResult> callTool(
     String name,
-    Map<String, dynamic> toolArguments,
-  ) async {
+    Map<String, dynamic> toolArguments, {
+    Duration? timeout,
+    McpCancellationToken? cancellationToken,
+  }) async {
     if (!_initialized) {
       throw McpError('Client is not initialized');
     }
@@ -524,9 +576,20 @@ class Client {
     // 2026-07-28 (SEP-2577): a stateless `tools/call` may return
     // `input_required`; the MRTR driver fulfills the server's input requests and
     // re-issues until a terminal result. Legacy path = a single request.
+    final deadline = DateTime.now().add(timeout ?? defaultRequestTimeout);
     final response = _statelessMode
-        ? await _sendRequestWithMrtr('tools/call', params)
-        : await _sendRequest('tools/call', params);
+        ? await _sendRequestWithMrtr(
+            'tools/call',
+            params,
+            deadline: deadline,
+            cancellationToken: cancellationToken,
+          )
+        : await _sendRequest(
+            'tools/call',
+            params,
+            deadline: deadline,
+            cancellationToken: cancellationToken,
+          );
     return CallToolResult.fromJson(response);
   }
 
@@ -568,14 +631,35 @@ class Client {
   /// Per spec, cancellation is a NOTIFICATION (`notifications/cancelled`),
   /// not a request — fire-and-forget with `requestId` and an optional
   /// `reason`.
-  void notifyCancelled(String requestId, {String? reason}) {
-    if (!_initialized) {
-      throw McpError('Client is not initialized');
+  ///
+  /// [requestId] is typed `Object` (not `String`) on purpose: the spec requires
+  /// the notification's `requestId` to be the ORIGINAL request id with its
+  /// exact JSON type. Ids minted by this client are `int` (see `_requestId`),
+  /// and a strict receiver matching on a typed request id silently drops a
+  /// string-typed `"7"` when it issued the number `7`. The value is emitted
+  /// raw — never stringified.
+  ///
+  /// This method NEVER throws: it is routinely called from timeout, teardown,
+  /// and disconnect paths. If the client is not initialized/connected, or the
+  /// transport rejects the send, the failure is logged and swallowed.
+  void notifyCancelled(Object requestId, {String? reason}) {
+    if (!_initialized || !isConnected) {
+      _logger.debug(
+        'Skipping notifications/cancelled for request $requestId: '
+        'client not initialized/connected',
+      );
+      return;
     }
-    _sendNotification('notifications/cancelled', {
-      'requestId': requestId,
-      if (reason != null) 'reason': reason,
-    });
+    try {
+      _sendNotification('notifications/cancelled', {
+        'requestId': requestId,
+        if (reason != null) 'reason': reason,
+      });
+    } catch (e) {
+      _logger.debug(
+        'Failed to send notifications/cancelled for request $requestId: $e',
+      );
+    }
   }
 
   /// Report progress on an in-flight server-initiated request (spec
@@ -598,8 +682,13 @@ class Client {
     });
   }
 
-  /// List available resources on the server
-  Future<List<Resource>> listResources() async {
+  /// List available resources on the server.
+  ///
+  /// Uses [defaultRequestTimeout]; [cancellationToken] aborts the in-flight
+  /// request.
+  Future<List<Resource>> listResources({
+    McpCancellationToken? cancellationToken,
+  }) async {
     if (!_initialized) {
       throw McpError('Client is not initialized');
     }
@@ -608,15 +697,26 @@ class Client {
       throw McpError('Server does not support resources');
     }
 
-    final response = await _sendRequest('resources/list', {});
+    final response = await _sendRequest(
+      'resources/list',
+      {},
+      cancellationToken: cancellationToken,
+    );
     final resourcesList = response['resources'] as List<dynamic>;
     return resourcesList
         .map((resource) => Resource.fromJson(resource))
         .toList();
   }
 
-  /// Read a resource from the server
-  Future<ReadResourceResult> readResource(String uri) async {
+  /// Read a resource from the server.
+  ///
+  /// Uses [defaultRequestTimeout] as the TOTAL budget (deadline computed here,
+  /// threaded through every MRTR round); [cancellationToken] aborts the
+  /// in-flight request.
+  Future<ReadResourceResult> readResource(
+    String uri, {
+    McpCancellationToken? cancellationToken,
+  }) async {
     if (!_initialized) {
       throw McpError('Client is not initialized');
     }
@@ -625,9 +725,20 @@ class Client {
       throw McpError('Server does not support resources');
     }
 
+    final deadline = DateTime.now().add(defaultRequestTimeout);
     final response = _statelessMode
-        ? await _sendRequestWithMrtr('resources/read', {'uri': uri})
-        : await _sendRequest('resources/read', {'uri': uri});
+        ? await _sendRequestWithMrtr(
+            'resources/read',
+            {'uri': uri},
+            deadline: deadline,
+            cancellationToken: cancellationToken,
+          )
+        : await _sendRequest(
+            'resources/read',
+            {'uri': uri},
+            deadline: deadline,
+            cancellationToken: cancellationToken,
+          );
 
     return ReadResourceResult.fromJson(response);
   }
@@ -661,8 +772,14 @@ class Client {
     return await readResource(uri);
   }
 
-  /// Subscribe to a resource
-  Future<void> subscribeResource(String uri) async {
+  /// Subscribe to a resource.
+  ///
+  /// Uses [defaultRequestTimeout]; [cancellationToken] aborts the in-flight
+  /// request.
+  Future<void> subscribeResource(
+    String uri, {
+    McpCancellationToken? cancellationToken,
+  }) async {
     if (!_initialized) {
       throw McpError('Client is not initialized');
     }
@@ -671,11 +788,21 @@ class Client {
       throw McpError('Server does not support resources');
     }
 
-    await _sendRequest('resources/subscribe', {'uri': uri});
+    await _sendRequest(
+      'resources/subscribe',
+      {'uri': uri},
+      cancellationToken: cancellationToken,
+    );
   }
 
-  /// Unsubscribe from a resource
-  Future<void> unsubscribeResource(String uri) async {
+  /// Unsubscribe from a resource.
+  ///
+  /// Uses [defaultRequestTimeout]; [cancellationToken] aborts the in-flight
+  /// request.
+  Future<void> unsubscribeResource(
+    String uri, {
+    McpCancellationToken? cancellationToken,
+  }) async {
     if (!_initialized) {
       throw McpError('Client is not initialized');
     }
@@ -684,11 +811,20 @@ class Client {
       throw McpError('Server does not support resources');
     }
 
-    await _sendRequest('resources/unsubscribe', {'uri': uri});
+    await _sendRequest(
+      'resources/unsubscribe',
+      {'uri': uri},
+      cancellationToken: cancellationToken,
+    );
   }
 
-  /// List resource templates on the server
-  Future<List<ResourceTemplate>> listResourceTemplates() async {
+  /// List resource templates on the server.
+  ///
+  /// Uses [defaultRequestTimeout]; [cancellationToken] aborts the in-flight
+  /// request.
+  Future<List<ResourceTemplate>> listResourceTemplates({
+    McpCancellationToken? cancellationToken,
+  }) async {
     if (!_initialized) {
       throw McpError('Client is not initialized');
     }
@@ -697,15 +833,24 @@ class Client {
       throw McpError('Server does not support resources');
     }
 
-    final response = await _sendRequest('resources/templates/list', {});
+    final response = await _sendRequest(
+      'resources/templates/list',
+      {},
+      cancellationToken: cancellationToken,
+    );
     final templatesList = response['resourceTemplates'] as List<dynamic>;
     return templatesList
         .map((template) => ResourceTemplate.fromJson(template))
         .toList();
   }
 
-  /// List available prompts on the server
-  Future<List<Prompt>> listPrompts() async {
+  /// List available prompts on the server.
+  ///
+  /// Uses [defaultRequestTimeout]; [cancellationToken] aborts the in-flight
+  /// request.
+  Future<List<Prompt>> listPrompts({
+    McpCancellationToken? cancellationToken,
+  }) async {
     if (!_initialized) {
       throw McpError('Client is not initialized');
     }
@@ -714,15 +859,29 @@ class Client {
       throw McpError('Server does not support prompts');
     }
 
-    final response = await _sendRequest('prompts/list', {});
+    final response = await _sendRequest(
+      'prompts/list',
+      {},
+      cancellationToken: cancellationToken,
+    );
     final promptsList = response['prompts'] as List<dynamic>;
     return promptsList.map((prompt) => Prompt.fromJson(prompt)).toList();
   }
 
-  /// Get a prompt from the server
+  /// Get a prompt from the server.
+  ///
+  /// Uses [defaultRequestTimeout] as the TOTAL budget (deadline computed here,
+  /// threaded through every MRTR round).
+  ///
+  /// [cancellationToken] is an optional THIRD POSITIONAL parameter rather than
+  /// a named one because [promptArguments] is already optional-positional and
+  /// Dart forbids mixing optional-positional and named parameters. Making it
+  /// named would have broken every existing positional caller; this stays
+  /// additive.
   Future<GetPromptResult> getPrompt(
     String name, [
     Map<String, dynamic>? promptArguments,
+    McpCancellationToken? cancellationToken,
   ]) async {
     if (!_initialized) {
       throw McpError('Client is not initialized');
@@ -740,9 +899,20 @@ class Client {
       params['arguments'] = Map<String, dynamic>.from(promptArguments);
     }
 
+    final deadline = DateTime.now().add(defaultRequestTimeout);
     final response = _statelessMode
-        ? await _sendRequestWithMrtr('prompts/get', params)
-        : await _sendRequest('prompts/get', params);
+        ? await _sendRequestWithMrtr(
+            'prompts/get',
+            params,
+            deadline: deadline,
+            cancellationToken: cancellationToken,
+          )
+        : await _sendRequest(
+            'prompts/get',
+            params,
+            deadline: deadline,
+            cancellationToken: cancellationToken,
+          );
     return GetPromptResult.fromJson(response);
   }
 
@@ -875,14 +1045,24 @@ class Client {
     }
   }
 
-  /// Set the logging level for the server
-  Future<void> setLoggingLevel(McpLogLevel level) async {
+  /// Set the logging level for the server.
+  ///
+  /// Uses [defaultRequestTimeout]; [cancellationToken] aborts the in-flight
+  /// request.
+  Future<void> setLoggingLevel(
+    McpLogLevel level, {
+    McpCancellationToken? cancellationToken,
+  }) async {
     if (!_initialized) {
       throw McpError('Client is not initialized');
     }
 
     // Spec method name is camelCase: `logging/setLevel`.
-    await _sendRequest('logging/setLevel', {'level': level.name});
+    await _sendRequest(
+      'logging/setLevel',
+      {'level': level.name},
+      cancellationToken: cancellationToken,
+    );
   }
 
   /// Register a notification handler
@@ -1023,18 +1203,36 @@ class Client {
     _errorStreamController.close();
   }
 
-  /// Handle transport disconnection
+  /// Handle transport disconnection.
+  ///
+  /// The connection is known dead here, so every in-flight request is failed
+  /// IMMEDIATELY with an [McpError] instead of being left to burn its full
+  /// timeout. Live `subscriptions/listen` streams are torn down the same way.
   void _onDisconnect() {
     _transport = null;
     _initialized = false;
 
     // Complete any pending requests with an error
-    for (final completer in _requestCompleters.values) {
+    final pending = List<Completer<dynamic>>.from(_requestCompleters.values);
+    _requestCompleters.clear();
+    for (final completer in pending) {
       if (!completer.isCompleted) {
         completer.completeError(McpError('Transport disconnected'));
       }
     }
-    _requestCompleters.clear();
+
+    // Tear down live subscription streams — their terminal response can never
+    // arrive now.
+    final subscriptions = List<_ClientSubscription>.from(_subscriptions.values);
+    _subscriptions.clear();
+    for (final sub in subscriptions) {
+      if (!sub.ackCompleter.isCompleted) {
+        sub.ackCompleter.completeError(McpError('Transport disconnected'));
+      }
+      if (!sub.controller.isClosed) {
+        sub.controller.close();
+      }
+    }
   }
 
   /// Handle incoming messages from the transport
@@ -1199,18 +1397,60 @@ class Client {
     }
   }
 
-  /// Send a JSON-RPC request
+  /// Send a JSON-RPC request.
+  ///
+  /// [deadline] is the absolute wall-clock instant this request must finish
+  /// by. It is computed ONCE by the public entry point and threaded down so a
+  /// Multi-Round-Trip exchange consumes a single shared budget instead of
+  /// restarting the clock on every round. When null, the deadline is
+  /// [defaultRequestTimeout] from now.
+  ///
+  /// [cancellationToken] is bound to the freshly minted request id
+  /// SYNCHRONOUSLY, before the first `await` and before the request is sent, so
+  /// a cancel that arrived earlier (latched on the token) is honored without
+  /// ever putting the request on the wire.
   Future<dynamic> _sendRequest(
     String method,
-    Map<String, dynamic> params,
-  ) async {
+    Map<String, dynamic> params, {
+    DateTime? deadline,
+    McpCancellationToken? cancellationToken,
+  }) async {
     if (!isConnected) {
       throw McpError('Client is not connected to a transport');
     }
 
+    final effectiveDeadline =
+        deadline ?? DateTime.now().add(defaultRequestTimeout);
+
     final id = _requestId++;
     final completer = Completer<dynamic>();
     _requestCompleters[id] = completer;
+
+    // Bind the token to this id before anything asynchronous happens. `_bind`
+    // returns false when the token was already cancelled (item 3: pre-bind
+    // latch) — in that case the request is never sent.
+    if (cancellationToken != null) {
+      final bound = cancellationToken._bind(() {
+        final pending = _requestCompleters.remove(id);
+        // Tell the server to stop working on it. Never throws.
+        notifyCancelled(id, reason: cancellationToken.reason);
+        if (pending != null && !pending.isCompleted) {
+          final error = McpError(
+            'Request cancelled: $method'
+            '${cancellationToken.reason != null ? ' (${cancellationToken.reason})' : ''}',
+          );
+          _errorStreamController.add(error);
+          pending.completeError(error);
+        }
+      });
+      if (!bound) {
+        _requestCompleters.remove(id);
+        throw McpError(
+          'Request cancelled before dispatch: $method'
+          '${cancellationToken.reason != null ? ' (${cancellationToken.reason})' : ''}',
+        );
+      }
+    }
 
     // Create a deep copy of params to avoid potential modification issues
     final Map<String, dynamic> safeParams = Map<String, dynamic>.from(params);
@@ -1235,17 +1475,23 @@ class Client {
       _transport!.send(request);
     } catch (e) {
       _requestCompleters.remove(id);
+      cancellationToken?._unbind();
       final error = McpError('Failed to send request: $e');
       _errorStreamController.add(error);
       throw error;
     }
 
     try {
-      // Add timeout for requests
+      // Remaining slice of the shared deadline (never negative — a deadline
+      // already in the past fires immediately).
+      final remaining = effectiveDeadline.difference(DateTime.now());
       final result = await completer.future.timeout(
-        const Duration(seconds: 30),
+        remaining.isNegative ? Duration.zero : remaining,
         onTimeout: () {
           _requestCompleters.remove(id);
+          // Best-effort: tell the server to stop working on the abandoned
+          // request. Never throws.
+          notifyCancelled(id, reason: 'timeout');
           final error = McpError('Request timed out: $method');
           _errorStreamController.add(error);
           throw error;
@@ -1259,6 +1505,10 @@ class Client {
         throw error;
       }
       rethrow;
+    } finally {
+      // The id is no longer in flight; a later cancel() on the same token must
+      // not emit a stale `notifications/cancelled` for it.
+      cancellationToken?._unbind();
     }
   }
 
@@ -1287,11 +1537,27 @@ class Client {
   /// the ORIGINAL request carrying the matching `inputResponses` + the echoed
   /// opaque `requestState`. Loops until a terminal (`complete`) result. On the
   /// legacy path (or a non-stateless client) this is a single `_sendRequest`.
+  ///
+  /// [deadline] is a SINGLE budget shared by every round — computed once by the
+  /// public entry point (or here, from [defaultRequestTimeout], if the caller
+  /// passed none). Rounds must never each get a fresh full timeout, or a caller
+  /// asking for N seconds could wait up to [_mrtrMaxRounds] × N.
   Future<Map<String, dynamic>> _sendRequestWithMrtr(
-      String method, Map<String, dynamic> params) async {
+    String method,
+    Map<String, dynamic> params, {
+    DateTime? deadline,
+    McpCancellationToken? cancellationToken,
+  }) async {
+    final effectiveDeadline =
+        deadline ?? DateTime.now().add(defaultRequestTimeout);
     var currentParams = params;
     for (var round = 0; round < _mrtrMaxRounds; round++) {
-      final raw = await _sendRequest(method, currentParams);
+      final raw = await _sendRequest(
+        method,
+        currentParams,
+        deadline: effectiveDeadline,
+        cancellationToken: cancellationToken,
+      );
       final result = raw is Map<String, dynamic>
           ? raw
           : Map<String, dynamic>.from(raw as Map);
@@ -1388,6 +1654,77 @@ class Client {
     };
 
     _transport!.send(notification);
+  }
+}
+
+/// Caller-supplied handle for cancelling an in-flight [Client] request.
+///
+/// The request methods are plain `async Future<T>`s, so a returned future can
+/// only report outward — it cannot be steered from the outside after the call
+/// starts. Cancellation therefore travels the other way: construct the token
+/// BEFORE the call, pass it in, keep the reference, and call [cancel] later.
+///
+/// ```dart
+/// final token = McpCancellationToken();
+/// final future = client.callTool('slow', {}, cancellationToken: token);
+/// // ...later, from a teardown / user-abort path:
+/// token.cancel(reason: 'user aborted');
+/// // `future` completes with an McpError.
+/// ```
+///
+/// Semantics:
+///  * [cancel] before the client binds the token to a request id (e.g. during
+///    async setup that runs before the call) is LATCHED: the request is never
+///    sent and the call fails immediately with an [McpError].
+///  * [cancel] while a request is in flight completes the caller's future with
+///    an [McpError], drops the pending completer, and emits the wire-level
+///    `notifications/cancelled` (with the ORIGINAL int request id) to the
+///    server.
+///  * [cancel] is idempotent and never throws — safe from cleanup paths.
+///  * A token is single-shot but may be handed to a sequence of calls (e.g.
+///    the MRTR loop's rounds); once cancelled it stays cancelled and every
+///    subsequent call fails at the bind step.
+///
+/// The failure is always an [McpError] — never a `TimeoutException` — so
+/// callers keep a single error type across timeout and cancellation paths.
+class McpCancellationToken {
+  bool _cancelled = false;
+  String? _reason;
+
+  /// Set by [Client] when it binds this token to a minted request id; cleared
+  /// once that request is no longer in flight.
+  void Function()? _onCancel;
+
+  /// Whether [cancel] has been called.
+  bool get isCancelled => _cancelled;
+
+  /// Reason passed to [cancel], if any. Forwarded to the server as the
+  /// `notifications/cancelled` `reason`.
+  String? get reason => _reason;
+
+  /// Cancel the associated request. Idempotent; never throws.
+  void cancel({String? reason}) {
+    if (_cancelled) return;
+    _cancelled = true;
+    _reason = reason;
+    final handler = _onCancel;
+    _onCancel = null;
+    handler?.call();
+  }
+
+  /// Bind a cancel handler for a freshly minted request id.
+  ///
+  /// Returns false when the token was already cancelled — the caller MUST NOT
+  /// send the request in that case (pre-bind latch).
+  bool _bind(void Function() onCancel) {
+    if (_cancelled) return false;
+    _onCancel = onCancel;
+    return true;
+  }
+
+  /// Detach the handler once the bound request is no longer in flight.
+  void _unbind() {
+    _onCancel = null;
   }
 }
 
